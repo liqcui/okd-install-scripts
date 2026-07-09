@@ -41,17 +41,17 @@ echo "旧目录清理完成，新建输出目录：${BASE_OUT}"
 
 # ====================== 预拉release镜像 ======================
 pull_release() {
-    echo "预拉取release镜像: ${RELEASE_IMG}"
+    echo "预拉取release镜像: ${FIXED_SCOS_RELEASE}"
     local cnt=0
-    # 仅在镜像不存在时尝试拉取，不预先删除
+    # 用digest引用拉取，确保本地镜像TAG为<none>，与scos-content保持一致
     while [[ $cnt -lt $MAX_RETRY ]]; do
-        if podman pull "${RELEASE_IMG}"; then
+        if podman pull "${FIXED_SCOS_RELEASE}"; then
             echo "release镜像拉取完成"
             return 0
         fi
         # 拉取失败，删除可能损坏的本地镜像后重试
         echo "拉取失败，清理本地残留镜像后重试..."
-        podman rmi -f "${RELEASE_IMG}" 2>/dev/null || true
+        podman rmi -f "${FIXED_SCOS_RELEASE}" 2>/dev/null || true
         cnt=$((cnt+1))
         if [[ $cnt -lt $MAX_RETRY ]]; then
             echo "等待10秒重试..."
