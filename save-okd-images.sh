@@ -20,7 +20,7 @@ OKD 4.22 SCOS 离线镜像导出脚本（统一全量导出）
   3. 自动过滤纯短名镜像与云厂商镜像，消除podman短名解析报错
   4. 保存digest镜像时自动补充repo:tag，确保podman load后镜像可按名称引用
   5. 生成image-tag-map.lst映射文件，记录digest与tag的对应关系
-  6. 统一导出所有镜像为单一 all-image.tar.gz，不区分角色分组
+  6. 统一导出所有镜像至 all-image 目录，不打包压缩
 EOF
 exit 0
 }
@@ -210,9 +210,6 @@ for img in "${clean_images[@]}"; do
     echo "保存完成：$tar_path (tag: $save_ref)"
 done
 
-echo -e "\n打包压缩包：$pack_file"
-tar -zcvf "$pack_file" -C "$BASE_OUT" "all-image"
 echo "===== 全部镜像导出完毕 ====="
-echo "输出目录：$BASE_OUT"
-echo "压缩包：$pack_file"
+echo "输出目录：$out_dir"
 echo "映射文件：${TAG_MAP_FILE}"
