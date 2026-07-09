@@ -18,8 +18,8 @@ OKD 4.22 SCOS 离线镜像导出脚本（统一全量导出）
   1. 启动自动清空旧导出目录，清除损坏tar包
   2. 拉取镜像时仅在失败或保存异常时删除本地残留镜像，正常情况保留已有镜像
   3. 自动过滤纯短名镜像与云厂商镜像，消除podman短名解析报错
-  4. 保存digest镜像时自动补充repo:tag，确保podman load后镜像可按名称引用
-  5. 生成image-tag-map.lst映射文件，记录digest与tag的对应关系
+  4. 保存镜像时保持原仓库名，load后podman images显示格式与原始一致
+  5. 生成image-tag-map.lst映射文件，记录digest与短名的对应关系
   6. 统一导出所有镜像至 all-image 目录，不打包压缩
 EOF
 exit 0
@@ -89,35 +89,6 @@ filter_cloud_images() {
     else
         echo "${res[@]}"
     fi
-}
-
-# ====================== 标签解析：确保digest镜像保存时携带repo:tag ======================
-resolve_save_tag() {
-    local digest_ref="$1"
-    local short_name="$2"
-
-    # FIXED_SCOS_RELEASE: 用已知 RELEASE_IMG tag
-    if [[ "$digest_ref" == "${FIXED_SCOS_RELEASE}" ]]; then
-        podman tag "$digest_ref" "${RELEASE_IMG}" 2>/dev/null || true
-        echo "${RELEASE_IMG}"
-        return 0
-    fi
-
-    # 检查镜像是否已有 RepoTags
-    local existing_tags
-    existing_tags=$(podman image inspect --format '{{.RepoTags}}' "$digest_ref" 2>/dev/null \
-        | tr -d '[]"' | sed 's/^ *//;s/ *$//')
-
-    if [[ -n "$existing_tags" ]]; then
-        echo "$existing_tags" | awk '{print $1}'
-        return 0
-    fi
-
-    # 无 tag: 用短名构造 repo:short_name
-    local repo="${digest_ref%%@*}"
-    local derived_tag="${repo}:${short_name}"
-    podman tag "$digest_ref" "$derived_tag"
-    echo "$derived_tag"
 }
 
 # ====================== 镜像拉取重试 ======================
@@ -208,26 +179,21 @@ for img in "${clean_images[@]}"; do
     echo "===== 处理镜像：$img ===="
     pull_with_retry "$img"
 
-    # 解析保存引用：确保digest镜像带有repo:tag
     short_name="${DIGEST_TO_SHORTNAME[$img]:-unknown}"
-    save_ref=$(resolve_save_tag "$img" "$short_name")
-
-    echo "保存引用：$save_ref (原始digest: $img)"
-    if podman save -o "$tar_path" "$save_ref"; then
-        echo "保存完成：$tar_path (tag: $save_ref)"
+    echo "保存镜像：$img (短名: $short_name)"
+    if podman save -o "$tar_path" "$img"; then
+        echo "保存完成：$tar_path"
     else
         # 保存失败：删除本地可能损坏的镜像后重新拉取并保存
         echo "保存异常，清理本地镜像后重新拉取..."
         podman rmi -f "$img" 2>/dev/null || true
         pull_with_retry "$img"
-        save_ref=$(resolve_save_tag "$img" "$short_name")
-        podman save -o "$tar_path" "$save_ref"
-        echo "重试保存完成：$tar_path (tag: $save_ref)"
+        podman save -o "$tar_path" "$img"
+        echo "重试保存完成：$tar_path"
     fi
 
-    # 记录映射：digest_ref tagged_ref short_name
-    echo "$img $save_ref $short_name" >> "${TAG_MAP_FILE}"
-    echo "保存完成：$tar_path (tag: $save_ref)"
+    # 记录映射：digest_ref short_name
+    echo "$img $short_name" >> "${TAG_MAP_FILE}"
 done
 
 echo "===== 全部镜像导出完毕 ====="
