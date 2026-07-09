@@ -18,11 +18,12 @@ OKD 离线镜像上传加载工具（免密SSH/SCP，直接传tar不压缩）
 
 逻辑：
   1. SCP逐个上传镜像tar文件至远端 /var/tmp/okd-img-tmp
-  2. 远端逐个 podman load 导入镜像，边传边导
+  2. 远端逐个 sudo podman load 导入镜像，边传边导
   3. 执行完毕自动清理远端临时文件
 优势：
   不再打包压缩/解压，省去tar.gz压缩和解压时间，边传边导节省总耗时
 要求：本机到目标节点core用户已配置 SSH 免密登录
+      远端通过 sudo podman load 导入镜像（core用户需有sudo权限）
 EOF
 exit 0
 }
@@ -62,7 +63,7 @@ echo "============================================="
 echo "[准备] 初始化远端临时目录"
 ssh core@"${NODE}" "rm -rf ${TMP_REMOTE}; mkdir -p ${TMP_REMOTE}"
 
-# 2. 逐个 SCP + 远端 podman load（边传边导）
+# 2. 逐个 SCP + 远端 sudo podman load（边传边导）
 total=${#tar_files[@]}
 idx=0
 for tar_file in "${tar_files[@]}"; do
@@ -74,13 +75,13 @@ for tar_file in "${tar_files[@]}"; do
     echo "  [上传] SCP ${tar_name} -> ${NODE}:${TMP_REMOTE}/"
     scp -q "$tar_file" core@"${NODE}:${TMP_REMOTE}/"
 
-    # 远端 podman load 该tar，完成后删除远端tar节省磁盘
-    echo "  [导入] 远端 podman load ${tar_name}"
+    # 远端 sudo podman load 该tar，完成后删除远端tar节省磁盘
+    echo "  [导入] 远端 sudo podman load ${tar_name}"
     ssh core@"${NODE}" bash -s "${TMP_REMOTE}" "${tar_name}" << 'REMOTE_CODE'
 set -euo pipefail
 TMP_DIR="$1"
 TAR_NAME="$2"
-podman load -i "${TMP_DIR}/${TAR_NAME}"
+sudo podman load -i "${TMP_DIR}/${TAR_NAME}"
 rm -f "${TMP_DIR}/${TAR_NAME}"
 REMOTE_CODE
 
@@ -94,4 +95,4 @@ echo -e "\n============================================="
 echo "全部镜像上传导入任务完成！(${total}个)"
 echo "节点 ${NODE} 镜像列表预览："
 echo "============================================="
-ssh core@"${NODE}" "podman images | head -30"
+ssh core@"${NODE}" "sudo podman images | head -30"
