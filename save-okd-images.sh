@@ -6,63 +6,43 @@ FIXED_SCOS_RELEASE="quay.io/okd/scos-release@sha256:765b8a3547a0cd97152dfb2fe4e5
 CLOUD_FILTER=("aws" "gcp" "azure" "ibm" "powervs")
 BASE_OUT="./okd-offline-images"
 MAX_RETRY=3
+TAG_MAP_FILE="${BASE_OUT}/image-tag-map.lst"
+IMAGE_LIST_FILE="okd-images.lst"
 
 # ====================== 帮助文档 ======================
 usage() {
 cat << EOF
-OKD 4.22 SCOS 离线镜像导出脚本
-用法：$0 [bootstrap|master|worker|ostree|all]
-参数：
-  bootstrap  导出bootstrap全套渲染镜像
-  master     导出控制平面master组件镜像
-  worker     导出worker计算节点通用镜像
-  ostree     仅提示scos使用bootc预拉取
-  all        一次性导出bootstrap+master+worker
+OKD 4.22 SCOS 离线镜像导出脚本（统一全量导出）
+用法：$0
 内置修复：
   1. 启动自动清空旧导出目录，清除损坏tar包
   2. 拉取镜像前强制删除本地残缺镜像，规避layer not known
-  3. 自动过滤纯短名镜像，消除podman短名解析报错
+  3. 自动过滤纯短名镜像与云厂商镜像，消除podman短名解析报错
+  4. 保存digest镜像时自动补充repo:tag，确保podman load后镜像可按名称引用
+  5. 生成image-tag-map.lst映射文件，记录digest与tag的对应关系
+  6. 统一导出所有镜像为单一 all-image.tar.gz，不区分角色分组
 EOF
 exit 0
 }
 
-# ====================== 参数校验 ======================
-if [[ $# -eq 0 ]]; then
-    usage
-fi
-if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    usage
-fi
-if [[ $# -gt 1 ]]; then
-    echo "错误：仅支持单个参数，执行 $0 --help"
-    exit 1
-fi
-ARG="$1"
-ALLOW_ARGS=("bootstrap" "master" "worker" "ostree" "all")
-VALID=0
-for a in "${ALLOW_ARGS[@]}"; do
-    if [[ "$ARG" == "$a" ]]; then
-        VALID=1
-        break
+if [[ $# -ne 0 ]]; then
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+        usage
     fi
-done
-if [[ $VALID -eq 0 ]]; then
-    echo "错误：无效参数 $ARG"
-    echo "合法参数：${ALLOW_ARGS[*]}"
+    echo "错误：本脚本无需参数，执行 $0 --help 查看说明"
     exit 1
 fi
 
-# ====================== 前置清理：步骤4 清空旧导出目录 ======================
+# ====================== 前置清理 ======================
 echo "===== 前置清理：删除历史损坏镜像导出文件 ====="
 rm -rf "${BASE_OUT}"
 mkdir -p "${BASE_OUT}"
 echo "旧目录清理完成，新建输出目录：${BASE_OUT}"
 
-# ====================== 工具：预拉release ======================
+# ====================== 预拉release镜像 ======================
 pull_release() {
     echo "预拉取release镜像: ${RELEASE_IMG}"
     local cnt=0
-    # 拉取前先清理本地残留镜像
     podman rmi -f "${RELEASE_IMG}" 2>/dev/null || true
     while [[ $cnt -lt $MAX_RETRY ]]; do
         if podman pull "${RELEASE_IMG}"; then
@@ -82,11 +62,11 @@ filter_cloud_images() {
     local img_list=("$@")
     local res=()
     for img in "${img_list[@]}"; do
-        # 1. 不含 / 纯短名直接丢弃
+        # 不含 / 纯短名直接丢弃
         if [[ "$img" != *"/"* ]]; then
             continue
         fi
-        # 2. 跳过云厂商镜像
+        # 跳过云厂商镜像
         local skip=0
         for cloud in "${CLOUD_FILTER[@]}"; do
             if [[ "$img" == *"$cloud"* ]]; then
@@ -98,34 +78,48 @@ filter_cloud_images() {
             res+=("$img")
         fi
     done
-    echo "${res[@]}"
+    # 通过返回值传递数组（空数组时返回空行，避免 unbound variable）
+    if [[ ${#res[@]} -eq 0 ]]; then
+        echo ""
+    else
+        echo "${res[@]}"
+    fi
 }
 
-# ====================== 按角色分组 ======================
-split_images_by_role() {
-    local all_raw=("$@")
-    declare -A bootstrap_arr master_arr worker_arr
-    bootstrap_arr["${FIXED_SCOS_RELEASE}"]=1
+# ====================== 标签解析：确保digest镜像保存时携带repo:tag ======================
+resolve_save_tag() {
+    local digest_ref="$1"
+    local short_name="$2"
 
-    for img in "${all_raw[@]}"; do
-        if [[ "$img" == *"-render"* || "$img" == *cluster-version* || "$img" == *config-operator* || "$img" == *authentication* ]]; then
-            bootstrap_arr["$img"]=1
-        elif [[ "$img" == *kube-apiserver* || "$img" == *kube-controller* || "$img" == *kube-scheduler* || "$img" == *etcd* || "$img" == *machine-config* ]]; then
-            master_arr["$img"]=1
-        else
-            worker_arr["$img"]=1
-        fi
-    done
-    echo "BOOTSTRAP ${!bootstrap_arr[*]}"
-    echo "MASTER ${!master_arr[*]}"
-    echo "WORKER ${!worker_arr[*]}"
+    # FIXED_SCOS_RELEASE: 用已知 RELEASE_IMG tag
+    if [[ "$digest_ref" == "${FIXED_SCOS_RELEASE}" ]]; then
+        podman tag "$digest_ref" "${RELEASE_IMG}" 2>/dev/null || true
+        echo "${RELEASE_IMG}"
+        return 0
+    fi
+
+    # 检查镜像是否已有 RepoTags
+    local existing_tags
+    existing_tags=$(podman image inspect --format '{{.RepoTags}}' "$digest_ref" 2>/dev/null \
+        | tr -d '[]"' | sed 's/^ *//;s/ *$//')
+
+    if [[ -n "$existing_tags" ]]; then
+        echo "$existing_tags" | awk '{print $1}'
+        return 0
+    fi
+
+    # 无 tag: 用短名构造 repo:short_name
+    local repo="${digest_ref%%@*}"
+    local derived_tag="${repo}:${short_name}"
+    podman tag "$digest_ref" "$derived_tag"
+    echo "$derived_tag"
 }
 
-# ====================== 镜像拉取重试：内置步骤3 拉取前清残缺镜像 ======================
+# ====================== 镜像拉取重试 ======================
 pull_with_retry() {
     local img="$1"
     local cnt=0
-    # 关键：拉取前强制删除本地损坏/残留镜像，解决layer not known
+    # 拉取前强制删除本地损坏/残留镜像，解决layer not known
     podman rmi -f "$img" 2>/dev/null || true
     while [[ $cnt -lt $MAX_RETRY ]]; do
         echo ">>> 拉取镜像 $img 第$((cnt+1))/$MAX_RETRY次"
@@ -140,91 +134,85 @@ pull_with_retry() {
     exit 1
 }
 
-# ====================== 导出打包 ======================
-export_single_group() {
-    local group_name="$1"
-    shift
-    local img_raw_list=("$@")
-    if [[ ${#img_raw_list[@]} -eq 0 ]]; then
-        echo "【${group_name}】无可用镜像，直接跳过"
-        return
-    fi
-    local out_dir="${BASE_OUT}/${group_name}-image"
-    local pack_file="${BASE_OUT}/${group_name}-image.tar.gz"
-
-    echo -e "\n===== 清理${group_name}旧文件 ===="
-    rm -rf "$out_dir"
-    rm -f "$pack_file"
-    mkdir -p "$out_dir"
-
-    echo "【${group_name}】待导出镜像总数：${#img_raw_list[@]}"
-    for idx in "${!img_raw_list[@]}"; do
-        echo "$((idx+1)). ${img_raw_list[$idx]}"
-    done
-    echo "===================================="
-
-    for img in "${img_raw_list[@]}"; do
-        tar_name=$(echo "$img" | sed 's/[@\/:]/_/g').tar
-        tar_path="${out_dir}/${tar_name}"
-        [[ -f "$tar_path" ]] && rm -f "$tar_path"
-        echo "===== 处理镜像：$img ===="
-        pull_with_retry "$img"
-        podman save -o "$tar_path" "$img"
-        echo "保存完成：$tar_path"
-    done
-
-    echo -e "\n打包压缩包：$pack_file"
-    tar -zcvf "$pack_file" -C "$BASE_OUT" "${group_name}-image"
-    echo "【${group_name}】打包完毕"
-}
-
 # ====================== 主流程 ======================
 pull_release
-echo "===== 从okd-images.lst读取完整镜像地址 ===="
-# 文件格式：<组件短名> <完整镜像URL>，使用awk逐行提取第二列，避免大文件内存问题
-IMAGE_LIST_FILE="okd-images.lst"
+
+# 读取镜像列表
+echo "===== 从 ${IMAGE_LIST_FILE} 读取完整镜像地址 ===="
 if [[ ! -f "${IMAGE_LIST_FILE}" ]]; then
     echo "错误：镜像列表文件 ${IMAGE_LIST_FILE} 不存在"
     exit 1
 fi
-# 使用awk流式读取，只提取第二列（镜像URL），sort -u去重
-raw_images=($(awk '{print $2}' "${IMAGE_LIST_FILE}" | sort -u))
-echo "原始镜像总数：${#raw_images[@]}"
 
-# 过滤：短名/云镜像全部剔除
-clean_images=($(filter_cloud_images "${raw_images[@]}"))
+# 构建digest→短名映射表 + 提取镜像URL列表
+declare -A DIGEST_TO_SHORTNAME
+raw_images=()
+while IFS=' ' read -r short_name full_ref; do
+    DIGEST_TO_SHORTNAME["$full_ref"]="$short_name"
+    raw_images+=("$full_ref")
+done < "${IMAGE_LIST_FILE}"
+# 附加 release 镜像
+DIGEST_TO_SHORTNAME["${FIXED_SCOS_RELEASE}"]="scos-release"
+raw_images+=("${FIXED_SCOS_RELEASE}")
+# 去重
+raw_images=($(echo "${raw_images[@]}" | tr ' ' '\n' | sort -u))
+echo "原始镜像总数：${#raw_images[@]}"
+echo "短名映射表构建完成，共${#DIGEST_TO_SHORTNAME[@]}条记录"
+
+# 过滤：短名/云镜像剔除
+filter_result=$(filter_cloud_images "${raw_images[@]}")
+if [[ -z "$filter_result" ]]; then
+    clean_images=()
+else
+    clean_images=($filter_result)
+fi
 echo "过滤后有效完整镜像数量：${#clean_images[@]}"
 
-# 分组
-split_out=$(split_images_by_role "${clean_images[@]}")
-BOOTSTRAP_IMGS=($(echo "$split_out" | grep ^BOOTSTRAP | sed 's/BOOTSTRAP //'))
-MASTER_IMGS=($(echo "$split_out" | grep ^MASTER | sed 's/MASTER //'))
-WORKER_IMGS=($(echo "$split_out" | grep ^WORKER | sed 's/WORKER //'))
-
-# ====================== 分支执行 ======================
-case "$ARG" in
-bootstrap)
-    export_single_group "bootstrap" "${BOOTSTRAP_IMGS[@]}"
-    ;;
-master)
-    export_single_group "master" "${MASTER_IMGS[@]}"
-    ;;
-worker)
-    export_single_group "worker" "${WORKER_IMGS[@]}"
-    ;;
-ostree)
-    echo "===== ostree系统镜像说明 ===="
-    echo "scos-content为系统分层镜像，使用bootc管理，不通过podman save导出"
-    ;;
-all)
-    export_single_group "bootstrap" "${BOOTSTRAP_IMGS[@]}"
-    export_single_group "master" "${MASTER_IMGS[@]}"
-    export_single_group "worker" "${WORKER_IMGS[@]}"
-    echo -e "\n全部组件镜像导出完成"
-    echo "输出目录：$BASE_OUT"
-    ;;
-*)
+if [[ ${#clean_images[@]} -eq 0 ]]; then
+    echo "错误：过滤后无可用镜像，终止执行"
     exit 1
-    ;;
-esac
+fi
 
+# ====================== 统一导出所有镜像 ======================
+out_dir="${BASE_OUT}/all-image"
+pack_file="${BASE_OUT}/all-image.tar.gz"
+
+echo -e "\n===== 统一导出全部镜像 ===="
+rm -rf "$out_dir"
+rm -f "$pack_file"
+mkdir -p "$out_dir"
+
+echo "待导出镜像总数：${#clean_images[@]}"
+for idx in "${!clean_images[@]}"; do
+    echo "$((idx+1)). ${clean_images[$idx]}"
+done
+echo "===================================="
+
+# 初始化映射文件
+> "${TAG_MAP_FILE}"
+
+for img in "${clean_images[@]}"; do
+    tar_name=$(echo "$img" | sed 's/[@\/:]/_/g').tar
+    tar_path="${out_dir}/${tar_name}"
+    [[ -f "$tar_path" ]] && rm -f "$tar_path"
+    echo "===== 处理镜像：$img ===="
+    pull_with_retry "$img"
+
+    # 解析保存引用：确保digest镜像带有repo:tag
+    short_name="${DIGEST_TO_SHORTNAME[$img]:-unknown}"
+    save_ref=$(resolve_save_tag "$img" "$short_name")
+
+    echo "保存引用：$save_ref (原始digest: $img)"
+    podman save -o "$tar_path" "$save_ref"
+
+    # 记录映射：digest_ref tagged_ref short_name
+    echo "$img $save_ref $short_name" >> "${TAG_MAP_FILE}"
+    echo "保存完成：$tar_path (tag: $save_ref)"
+done
+
+echo -e "\n打包压缩包：$pack_file"
+tar -zcvf "$pack_file" -C "$BASE_OUT" "all-image"
+echo "===== 全部镜像导出完毕 ====="
+echo "输出目录：$BASE_OUT"
+echo "压缩包：$pack_file"
+echo "映射文件：${TAG_MAP_FILE}"
