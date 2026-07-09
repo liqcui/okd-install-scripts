@@ -63,12 +63,16 @@ echo "============================================="
 echo "[准备] 初始化远端临时目录"
 ssh core@"${NODE}" "rm -rf ${TMP_REMOTE}; mkdir -p ${TMP_REMOTE}"
 
-# 2. 逐个 SCP + 远端 sudo podman load（边传边导）
+# 2. 逐个 SCP + 远端 sudo podman load（边传边导），统计耗时
 total=${#tar_files[@]}
 idx=0
+SECONDS=0
+declare -A img_times
+
 for tar_file in "${tar_files[@]}"; do
     idx=$((idx+1))
     tar_name=$(basename "$tar_file")
+    img_start=$SECONDS
     echo -e "\n===== [${idx}/${total}] 处理镜像：${tar_name} ====="
 
     # SCP 上传单个tar
@@ -85,14 +89,30 @@ sudo podman load -i "${TMP_DIR}/${TAR_NAME}"
 rm -f "${TMP_DIR}/${TAR_NAME}"
 REMOTE_CODE
 
-    echo "  [完成] ${tar_name} 已导入并清理"
+    img_elapsed=$(( SECONDS - img_start ))
+    img_times["$tar_name"]=$img_elapsed
+    echo "  [完成] ${tar_name} 已导入并清理 (耗时 ${img_elapsed}s)"
 done
+
+total_elapsed=$SECONDS
 
 # 清理远端临时目录（已为空，但确保干净）
 ssh core@"${NODE}" "rm -rf ${TMP_REMOTE}"
 
+# 格式化总耗时
+total_min=$(( total_elapsed / 60 ))
+total_sec=$(( total_elapsed % 60 ))
+
 echo -e "\n============================================="
 echo "全部镜像上传导入任务完成！(${total}个)"
-echo "节点 ${NODE} 镜像列表预览："
+echo "总耗时：${total_min}分${total_sec}秒"
+echo -e "\n各镜像耗时明细："
+for tar_name in "${!img_times[@]}"; do
+    t=${img_times[$tar_name]}
+    t_min=$(( t / 60 ))
+    t_sec=$(( t % 60 ))
+    printf "  %-60s %2d分%02d秒\n" "$tar_name" "$t_min" "$t_sec"
+done
+echo -e "\n节点 ${NODE} 镜像列表预览："
 echo "============================================="
 ssh core@"${NODE}" "sudo podman images | head -30"
