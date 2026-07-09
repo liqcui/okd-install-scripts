@@ -16,7 +16,7 @@ OKD 4.22 SCOS 离线镜像导出脚本（统一全量导出）
 用法：$0
 内置修复：
   1. 启动自动清空旧导出目录，清除损坏tar包
-  2. 拉取镜像前强制删除本地残缺镜像，规避layer not known
+  2. 拉取镜像时仅在失败或保存异常时删除本地残留镜像，正常情况保留已有镜像
   3. 自动过滤纯短名镜像与云厂商镜像，消除podman短名解析报错
   4. 保存digest镜像时自动补充repo:tag，确保podman load后镜像可按名称引用
   5. 生成image-tag-map.lst映射文件，记录digest与tag的对应关系
@@ -43,15 +43,20 @@ echo "旧目录清理完成，新建输出目录：${BASE_OUT}"
 pull_release() {
     echo "预拉取release镜像: ${RELEASE_IMG}"
     local cnt=0
-    podman rmi -f "${RELEASE_IMG}" 2>/dev/null || true
+    # 仅在镜像不存在时尝试拉取，不预先删除
     while [[ $cnt -lt $MAX_RETRY ]]; do
         if podman pull "${RELEASE_IMG}"; then
             echo "release镜像拉取完成"
             return 0
         fi
+        # 拉取失败，删除可能损坏的本地镜像后重试
+        echo "拉取失败，清理本地残留镜像后重试..."
+        podman rmi -f "${RELEASE_IMG}" 2>/dev/null || true
         cnt=$((cnt+1))
-        echo "拉取失败，等待10s重试..."
-        sleep 10
+        if [[ $cnt -lt $MAX_RETRY ]]; then
+            echo "等待10秒重试..."
+            sleep 10
+        fi
     done
     echo "连续${MAX_RETRY}次拉取release失败，终止脚本"
     exit 1
@@ -119,16 +124,21 @@ resolve_save_tag() {
 pull_with_retry() {
     local img="$1"
     local cnt=0
-    # 拉取前强制删除本地损坏/残留镜像，解决layer not known
-    podman rmi -f "$img" 2>/dev/null || true
+    # 正常流程：直接拉取，不预先删除本地镜像
+    # 如果镜像本地已存在且完整，podman pull 会跳过（layer已存在）
     while [[ $cnt -lt $MAX_RETRY ]]; do
         echo ">>> 拉取镜像 $img 第$((cnt+1))/$MAX_RETRY次"
         if podman pull "$img"; then
             return 0
         fi
+        # 拉取失败：删除可能损坏的本地残留镜像，解决layer not known
+        echo "拉取失败，清理本地残留镜像后重试..."
+        podman rmi -f "$img" 2>/dev/null || true
         cnt=$((cnt+1))
-        echo "拉取失败，等待10秒重试..."
-        sleep 10
+        if [[ $cnt -lt $MAX_RETRY ]]; then
+            echo "等待10秒重试..."
+            sleep 10
+        fi
     done
     echo "镜像 $img 拉取全部失败，退出"
     exit 1
@@ -203,7 +213,17 @@ for img in "${clean_images[@]}"; do
     save_ref=$(resolve_save_tag "$img" "$short_name")
 
     echo "保存引用：$save_ref (原始digest: $img)"
-    podman save -o "$tar_path" "$save_ref"
+    if podman save -o "$tar_path" "$save_ref"; then
+        echo "保存完成：$tar_path (tag: $save_ref)"
+    else
+        # 保存失败：删除本地可能损坏的镜像后重新拉取并保存
+        echo "保存异常，清理本地镜像后重新拉取..."
+        podman rmi -f "$img" 2>/dev/null || true
+        pull_with_retry "$img"
+        save_ref=$(resolve_save_tag "$img" "$short_name")
+        podman save -o "$tar_path" "$save_ref"
+        echo "重试保存完成：$tar_path (tag: $save_ref)"
+    fi
 
     # 记录映射：digest_ref tagged_ref short_name
     echo "$img $save_ref $short_name" >> "${TAG_MAP_FILE}"
