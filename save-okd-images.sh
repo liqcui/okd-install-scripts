@@ -18,7 +18,7 @@ OKD 4.22 SCOS 离线镜像导出脚本（统一全量导出）
   1. 启动自动清空旧导出目录，清除损坏tar包
   2. 拉取镜像时仅在失败或保存异常时删除本地残留镜像，正常情况保留已有镜像
   3. 自动过滤纯短名镜像与云厂商镜像，消除podman短名解析报错
-  4. 保存镜像时保持原仓库名，load后podman images显示格式与原始一致
+  4. 保存镜像时用短名作为tag，确保podman load后REPOSITORY有仓库名（TAG列为组件短名）
   5. 生成image-tag-map.lst映射文件，记录digest与短名的对应关系
   6. 统一导出所有镜像至 all-image 目录，不打包压缩
 EOF
@@ -89,6 +89,19 @@ filter_cloud_images() {
     else
         echo "${res[@]}"
     fi
+}
+
+# ====================== 标签补全：为digest镜像添加repo:short_name tag ======================
+# podman save 对digest-only引用生成的tar，manifest.json的RepoTags为空数组，
+# podman load后REPOSITORY显示<none>。需要先用podman tag加上仓库名:短名，
+# 再用tagged引用做save，确保load后REPOSITORY有值。
+add_save_tag() {
+    local digest_ref="$1"
+    local short_name="$2"
+    local repo="${digest_ref%%@*}"
+    local tagged_ref="${repo}:${short_name}"
+    podman tag "$digest_ref" "$tagged_ref" 2>/dev/null || true
+    echo "$tagged_ref"
 }
 
 # ====================== 镜像拉取重试 ======================
@@ -180,20 +193,23 @@ for img in "${clean_images[@]}"; do
     pull_with_retry "$img"
 
     short_name="${DIGEST_TO_SHORTNAME[$img]:-unknown}"
-    echo "保存镜像：$img (短名: $short_name)"
-    if podman save -o "$tar_path" "$img"; then
+    # 为digest镜像添加tag，确保save后tar包的manifest.json有RepoTags
+    save_ref=$(add_save_tag "$img" "$short_name")
+    echo "保存镜像：$save_ref (原始digest: $img, 名: $short_name)"
+    if podman save -o "$tar_path" "$save_ref"; then
         echo "保存完成：$tar_path"
     else
         # 保存失败：删除本地可能损坏的镜像后重新拉取并保存
         echo "保存异常，清理本地镜像后重新拉取..."
         podman rmi -f "$img" 2>/dev/null || true
         pull_with_retry "$img"
-        podman save -o "$tar_path" "$img"
+        save_ref=$(add_save_tag "$img" "$short_name")
+        podman save -o "$tar_path" "$save_ref"
         echo "重试保存完成：$tar_path"
     fi
 
-    # 记录映射：digest_ref short_name
-    echo "$img $short_name" >> "${TAG_MAP_FILE}"
+    # 记录映射：digest_ref tagged_ref short_name
+    echo "$img $save_ref $short_name" >> "${TAG_MAP_FILE}"
 done
 
 echo "===== 全部镜像导出完毕 ====="
